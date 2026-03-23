@@ -113,8 +113,7 @@ async function fetchAgentCard(endpoint) {
 
 // ── Build & sign task request ─────────────────────────────────────────────────
 
-function buildTaskRequest({ from, to, payload, callbackUrl, secret }) {
-  const taskId = crypto.randomUUID();
+function buildTaskRequest({ taskId, from, to, payload, callbackUrl, secret }) {
   const timestamp = Date.now();
 
   const task = {
@@ -125,10 +124,10 @@ function buildTaskRequest({ from, to, payload, callbackUrl, secret }) {
     payload,
     callbackUrl,
     timestamp,
-    signature: '', // filled below
+    signature: '',
   };
 
-  // Sign the body (we sign the serialized task without the signature field)
+  // Sign after all fields are final
   const bodyForSigning = JSON.stringify({ ...task, signature: '' }, null, 2);
   task.signature = secret
     ? sign(secret, taskId, timestamp, Buffer.from(bodyForSigning))
@@ -205,26 +204,18 @@ async function main() {
     console.warn('[ATA Client] Proceeding without card verification...');
   }
 
-  // Step 2: Build & sign task request (taskId generated once inside)
+  // Step 2: Generate taskId first, build callback URL, sign once — no double-sign
+  const taskId = crypto.randomUUID();
+  const callbackUrl = args.callback || `${config.publicUrl}/ata/v1/callback/${taskId}`;
+
   const task = buildTaskRequest({
+    taskId,
     from: fromId,
     to: peerCard?.id || endpoint,
     payload,
-    callbackUrl: args.callback || null, // resolved below after we have taskId
+    callbackUrl,
     secret,
   });
-
-  // Override callback URL now that we have the stable taskId
-  if (!args.callback) {
-    task.callbackUrl = `${config.publicUrl}/ata/v1/callback/${task.taskId}`;
-    // Re-sign with updated callbackUrl
-    const bodyForSigning = JSON.stringify({ ...task, signature: '' }, null, 2);
-    task.signature = secret
-      ? sign(secret, task.taskId, task.timestamp, Buffer.from(bodyForSigning))
-      : 'unsigned';
-  }
-
-  const taskId = task.taskId;
 
   console.log(`[ATA Client] Sending task ${task.taskId}`);
   console.log(`[ATA Client] Action: ${payload.action}`);

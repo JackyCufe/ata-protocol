@@ -104,8 +104,12 @@ async function handleIncomingTask(req, res, rawBody) {
   }
 
   // Signature verification
+  // The client signs the body with signature='', so we must reconstruct that for comparison
   const timestamp = task.timestamp || 0;
-  const sigResult = verify(config.sharedSecret, task.taskId, timestamp, rawBody, task.signature);
+  const bodyForVerify = Buffer.from(
+    JSON.stringify({ ...task, signature: '' }, null, 2)
+  );
+  const sigResult = verify(config.sharedSecret, task.taskId, timestamp, bodyForVerify, task.signature);
   if (!sigResult.ok) {
     console.warn(`[ATA] Signature rejected for task ${task.taskId}: ${sigResult.reason}`);
     return sendJson(res, 401, { error: 'Signature verification failed', reason: sigResult.reason });
