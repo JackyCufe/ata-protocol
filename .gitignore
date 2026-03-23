@@ -1,0 +1,12 @@
+# Environment
+.env
+
+# Task state (contains task payloads, may include sensitive data)
+data/
+
+# Logs
+*.log
+
+# Editor
+.DS_Store
+.vscode/

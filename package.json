@@ -1,0 +1,11 @@
+{
+  "name": "ata-protocol",
+  "version": "0.1.0",
+  "description": "Agent-to-Agent cross-instance communication protocol for OpenClaw",
+  "license": "MIT",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "server": "node ata-server.js",
+    "client": "node ata-client.js"
+  }
+}

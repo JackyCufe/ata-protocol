@@ -205,27 +205,26 @@ async function main() {
     console.warn('[ATA Client] Proceeding without card verification...');
   }
 
-  // Step 2: Build callback URL (where peer will POST the result)
-  const taskId = crypto.randomUUID();
-  const callbackUrl = args.callback
-    || `${config.publicUrl}/ata/v1/callback/${taskId}`;
-
-  // Step 3: Build & sign task request
+  // Step 2: Build & sign task request (taskId generated once inside)
   const task = buildTaskRequest({
     from: fromId,
     to: peerCard?.id || endpoint,
     payload,
-    callbackUrl,
+    callbackUrl: args.callback || null, // resolved below after we have taskId
     secret,
   });
 
-  // Use our pre-generated taskId (override the one in buildTaskRequest)
-  task.taskId = taskId;
-  // Re-sign with correct taskId
-  const bodyForSigning = JSON.stringify({ ...task, signature: '' }, null, 2);
-  task.signature = secret
-    ? sign(secret, taskId, task.timestamp, Buffer.from(bodyForSigning))
-    : 'unsigned';
+  // Override callback URL now that we have the stable taskId
+  if (!args.callback) {
+    task.callbackUrl = `${config.publicUrl}/ata/v1/callback/${task.taskId}`;
+    // Re-sign with updated callbackUrl
+    const bodyForSigning = JSON.stringify({ ...task, signature: '' }, null, 2);
+    task.signature = secret
+      ? sign(secret, task.taskId, task.timestamp, Buffer.from(bodyForSigning))
+      : 'unsigned';
+  }
+
+  const taskId = task.taskId;
 
   console.log(`[ATA Client] Sending task ${task.taskId}`);
   console.log(`[ATA Client] Action: ${payload.action}`);

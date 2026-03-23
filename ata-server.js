@@ -132,6 +132,7 @@ async function handleIncomingTask(req, res, rawBody) {
     gatewayUrl: config.gatewayUrl,
     gatewayToken: config.gatewayToken,
     task: record,
+    localAgentId: config.localAgentId,
   }).then(({ accepted, message }) => {
     const status = accepted ? 'forwarded' : 'gateway_error';
     storage.update(task.taskId, { status, gatewayMessage: message });
