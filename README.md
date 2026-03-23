@@ -139,8 +139,68 @@ node ata-client.js \
 
 ---
 
-## Built on OpenClaw
+## Framework Compatibility
 
-This project extends [OpenClaw](https://github.com/openclaw/openclaw)'s multi-agent architecture to cross-instance communication. It's designed to work alongside ACP, not replace it.
+### The protocol is universal. The execution adapter is not.
+
+ATA has two distinct layers:
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Protocol layer (framework-agnostic)                │
+│  Agent Card · Task signing · Callback · Status poll │
+└─────────────────────────────────────────────────────┘
+                        ↓
+┌─────────────────────────────────────────────────────┐
+│  Execution adapter (framework-specific)             │
+│  How does the receiving agent actually run the task?│
+└─────────────────────────────────────────────────────┘
+```
+
+**The protocol layer works with any agent, any framework.**
+Anyone who can run an HTTP server and verify HMAC can participate — Python agents, Go agents, another person's OpenClaw, a fully custom agent runtime.
+
+**The execution adapter (`lib/gateway.js`) is currently OpenClaw-specific.**
+When a task arrives, the server forwards it to a local OpenClaw gateway via `POST /tools/invoke`. This is an OpenClaw API.
+
+### Can I use ATA without OpenClaw?
+
+Yes — with one change. Replace `lib/gateway.js` with your own adapter:
+
+```js
+// lib/gateway.js — replace this function body
+async function forwardToGateway({ task }) {
+  // Option A: HTTP call to your agent's own API
+  await fetch('http://localhost:8080/run', {
+    method: 'POST',
+    body: JSON.stringify({ taskId: task.taskId, action: task.payload.action }),
+  });
+
+  // Option B: Write to a queue (Redis, SQS, etc.)
+  await queue.push(task);
+
+  // Option C: Spawn a subprocess
+  spawn('python', ['agent.py', '--task', JSON.stringify(task)]);
+
+  return { accepted: true, message: 'forwarded' };
+}
+```
+
+The rest of the server (`ata-server.js`, `lib/crypto.js`, `lib/storage.js`) is pure Node.js with no framework dependency.
+
+### Summary
+
+| Component | OpenClaw required? |
+|-----------|-------------------|
+| Protocol (signing, cards, callbacks) | ❌ No |
+| Sending tasks (`ata-client.js`) | ❌ No |
+| Receiving tasks (`ata-server.js`) | ❌ No |
+| Executing tasks (`lib/gateway.js`) | ⚠️ Default yes, swap to remove |
+
+---
+
+## Built with OpenClaw in mind
+
+This project was designed alongside [OpenClaw](https://github.com/openclaw/openclaw)'s multi-agent architecture. The default execution adapter targets OpenClaw's gateway, but the protocol itself is an open spec — any agent runtime can implement it.
 
 *Made by [@Jacky_cufe](https://x.com/Jacky_cufe) — building in public.*
