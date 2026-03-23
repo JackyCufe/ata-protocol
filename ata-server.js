@@ -23,7 +23,7 @@ const crypto = require('crypto');
 const { loadConfig } = require('./lib/config');
 const { verify } = require('./lib/crypto');
 const { TaskStorage } = require('./lib/storage');
-const { forwardToGateway } = require('./lib/gateway');
+const { executeTask } = require('./lib/executor');
 
 const config = loadConfig();
 const storage = new TaskStorage(config.dataDir);
@@ -123,19 +123,16 @@ async function handleIncomingTask(req, res, rawBody) {
   console.log(`[ATA] ← task ${task.taskId} from ${task.from} (action: ${task.payload?.action})`);
   sendJson(res, 202, { accepted: true, taskId: task.taskId, message: 'Task received and queued' });
 
-  // Fire-and-forget: forward to local OpenClaw gateway
-  forwardToGateway({
-    gatewayUrl: config.gatewayUrl,
-    gatewayToken: config.gatewayToken,
-    localAgentId: config.localAgentId,
-    task: record,
-  }).then(({ accepted, message }) => {
-    storage.update(task.taskId, { status: accepted ? 'forwarded' : 'gateway_error', gatewayMessage: message });
-    console.log(`[ATA] Gateway: ${accepted ? 'forwarded' : 'error'} — ${message}`);
-  }).catch((err) => {
-    storage.update(task.taskId, { status: 'gateway_error', gatewayError: err.message });
-    console.error(`[ATA] Gateway error: ${err.message}`);
-  });
+  // Fire-and-forget: execute task in-process and POST result to callbackUrl
+  executeTask({ task: record, callbackUrl: record.callbackUrl })
+    .then(({ accepted, message }) => {
+      storage.update(task.taskId, { status: accepted ? 'executing' : 'failed', executorMessage: message });
+      console.log(`[ATA] Executor: ${message}`);
+    })
+    .catch((err) => {
+      storage.update(task.taskId, { status: 'failed', executorError: err.message });
+      console.error(`[ATA] Executor error: ${err.message}`);
+    });
 }
 
 async function handleCallback(req, res, taskId, rawBody) {
