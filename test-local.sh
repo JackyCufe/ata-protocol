@@ -125,7 +125,7 @@ ATA_DATA_DIR="/tmp/ata-test-data-a" \
   node "$SCRIPT_DIR/ata-client.js" \
     --to http://127.0.0.1:3741/ata/v1 \
     --task '{"action":"ping"}' \
-    --wait false 2>&1)
+    --wait false 2>&1 || true)
 echo "$REJECT_RESULT"
 if echo "$REJECT_RESULT" | grep -q "rejected\|401\|Signature\|failed"; then
   ok "签名验证正确拒绝了无效请求 ✅"

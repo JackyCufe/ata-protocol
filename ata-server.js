@@ -2,10 +2,12 @@
 /**
  * ATA Protocol Server
  *
- * Exposes three endpoints:
- *   GET  /ata/v1/agent-card          — Publish this agent's card
+ * Endpoints:
+ *   GET  /ata/v1/agent-card          — Publish this agent's capabilities
  *   POST /ata/v1/task                 — Receive task from remote agent
  *   POST /ata/v1/callback/:taskId     — Receive result callback
+ *   GET  /ata/v1/task/:taskId/status  — Poll task status
+ *   GET  /health                      — Health check
  *
  * Usage:
  *   cp .env.example .env && vi .env
@@ -14,7 +16,7 @@
 
 'use strict';
 
-require('./lib/env');          // load .env if present
+require('./lib/env');
 
 const http = require('http');
 const crypto = require('crypto');
@@ -35,9 +37,6 @@ function buildAgentCard() {
     owner: config.agentOwner,
     capabilities: config.capabilities,
     endpoint: `${config.publicUrl}/ata/v1`,
-    // In production replace with real RSA/Ed25519 public key.
-    // For MVP we advertise a fingerprint of the shared secret so peers can
-    // verify they're talking to the right instance without exposing the secret.
     publicKey: derivePublicFingerprint(config.sharedSecret),
     version: config.agentVersion,
     protocol: 'ata/0.1',
@@ -70,58 +69,50 @@ function sendJson(res, status, data) {
 }
 
 function parseJson(buf) {
-  try {
-    return { ok: true, value: JSON.parse(buf.toString('utf8')) };
-  } catch (e) {
-    return { ok: false, error: e.message };
-  }
+  try { return { ok: true, value: JSON.parse(buf.toString('utf8')) }; }
+  catch (e) { return { ok: false, error: e.message }; }
+}
+
+// ── Validation ────────────────────────────────────────────────────────────────
+
+function validateTaskSchema(task) {
+  const required = ['from', 'to', 'taskId', 'type', 'payload', 'callbackUrl'];
+  const missing = required.filter((f) => !task[f]);
+  if (missing.length) return { ok: false, error: 'Missing required fields', fields: missing };
+  if (task.type !== 'task_request') return { ok: false, error: `Unexpected type: ${task.type}` };
+  return { ok: true };
+}
+
+function verifyTaskSignature(task, rawBody) {
+  const bodyForVerify = Buffer.from(JSON.stringify({ ...task, signature: '' }, null, 2));
+  return verify(config.sharedSecret, task.taskId, task.timestamp || 0, bodyForVerify, task.signature);
 }
 
 // ── Route handlers ────────────────────────────────────────────────────────────
 
-async function handleAgentCard(req, res) {
+async function handleAgentCard(_req, res) {
   sendJson(res, 200, buildAgentCard());
 }
 
 async function handleIncomingTask(req, res, rawBody) {
   const parsed = parseJson(rawBody);
-  if (!parsed.ok) {
-    return sendJson(res, 400, { error: 'Invalid JSON', detail: parsed.error });
-  }
+  if (!parsed.ok) return sendJson(res, 400, { error: 'Invalid JSON', detail: parsed.error });
 
   const task = parsed.value;
 
-  // Basic schema validation
-  const missing = ['from', 'to', 'taskId', 'type', 'payload', 'callbackUrl'].filter(
-    (f) => !task[f],
-  );
-  if (missing.length) {
-    return sendJson(res, 400, { error: 'Missing required fields', fields: missing });
-  }
+  const schemaCheck = validateTaskSchema(task);
+  if (!schemaCheck.ok) return sendJson(res, 400, schemaCheck);
 
-  if (task.type !== 'task_request') {
-    return sendJson(res, 400, { error: `Unexpected type: ${task.type}` });
-  }
-
-  // Signature verification
-  // The client signs the body with signature='', so we must reconstruct that for comparison
-  const timestamp = task.timestamp || 0;
-  const bodyForVerify = Buffer.from(
-    JSON.stringify({ ...task, signature: '' }, null, 2)
-  );
-  const sigResult = verify(config.sharedSecret, task.taskId, timestamp, bodyForVerify, task.signature);
+  const sigResult = verifyTaskSignature(task, rawBody);
   if (!sigResult.ok) {
     console.warn(`[ATA] Signature rejected for task ${task.taskId}: ${sigResult.reason}`);
     return sendJson(res, 401, { error: 'Signature verification failed', reason: sigResult.reason });
   }
 
-  // Idempotency: reject duplicate task IDs
-  const existing = storage.get(task.taskId);
-  if (existing) {
+  if (storage.get(task.taskId)) {
     return sendJson(res, 409, { error: 'Task already exists', taskId: task.taskId });
   }
 
-  // Persist task
   const record = storage.save({
     ...task,
     status: 'received',
@@ -129,49 +120,34 @@ async function handleIncomingTask(req, res, rawBody) {
     updatedAt: new Date().toISOString(),
   });
 
-  console.log(`[ATA] ← Received task ${task.taskId} from ${task.from} (action: ${task.payload?.action})`);
+  console.log(`[ATA] ← task ${task.taskId} from ${task.from} (action: ${task.payload?.action})`);
+  sendJson(res, 202, { accepted: true, taskId: task.taskId, message: 'Task received and queued' });
 
-  // Forward to local OpenClaw gateway (fire-and-forget)
+  // Fire-and-forget: forward to local OpenClaw gateway
   forwardToGateway({
     gatewayUrl: config.gatewayUrl,
     gatewayToken: config.gatewayToken,
-    task: record,
     localAgentId: config.localAgentId,
+    task: record,
   }).then(({ accepted, message }) => {
-    const status = accepted ? 'forwarded' : 'gateway_error';
-    storage.update(task.taskId, { status, gatewayMessage: message });
-    console.log(`[ATA] Gateway forward: ${status} — ${message}`);
+    storage.update(task.taskId, { status: accepted ? 'forwarded' : 'gateway_error', gatewayMessage: message });
+    console.log(`[ATA] Gateway: ${accepted ? 'forwarded' : 'error'} — ${message}`);
   }).catch((err) => {
     storage.update(task.taskId, { status: 'gateway_error', gatewayError: err.message });
-    console.error(`[ATA] Gateway forward error: ${err.message}`);
-  });
-
-  sendJson(res, 202, {
-    accepted: true,
-    taskId: task.taskId,
-    message: 'Task received and queued for processing',
+    console.error(`[ATA] Gateway error: ${err.message}`);
   });
 }
 
 async function handleCallback(req, res, taskId, rawBody) {
   const parsed = parseJson(rawBody);
-  if (!parsed.ok) {
-    return sendJson(res, 400, { error: 'Invalid JSON', detail: parsed.error });
-  }
+  if (!parsed.ok) return sendJson(res, 400, { error: 'Invalid JSON', detail: parsed.error });
 
   const result = parsed.value;
-
   const existing = storage.get(taskId);
+
   if (!existing) {
-    // Accept the callback anyway — the client may poll this endpoint
-    storage.save({
-      taskId,
-      status: result.status || 'completed',
-      result: result.result,
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-      _orphanCallback: true,
-    });
+    storage.save({ taskId, status: result.status || 'completed', result: result.result,
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), _orphanCallback: true });
     console.log(`[ATA] ← Callback for unknown task ${taskId} — stored as orphan`);
     return sendJson(res, 200, { stored: true });
   }
@@ -188,57 +164,33 @@ async function handleCallback(req, res, taskId, rawBody) {
 
 async function handleStatusCheck(req, res, taskId) {
   const task = storage.get(taskId);
-  if (!task) {
-    return sendJson(res, 404, { error: 'Task not found', taskId });
-  }
-  sendJson(res, 200, {
-    taskId: task.taskId,
-    status: task.status,
-    result: task.result || null,
-    createdAt: task.createdAt,
-    updatedAt: task.updatedAt,
-  });
+  if (!task) return sendJson(res, 404, { error: 'Task not found', taskId });
+  sendJson(res, 200, { taskId: task.taskId, status: task.status, result: task.result || null,
+    createdAt: task.createdAt, updatedAt: task.updatedAt });
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────
 
-const TASK_CALLBACK_RE = /^\/ata\/v1\/callback\/([^/?]+)$/;
-const TASK_STATUS_RE   = /^\/ata\/v1\/task\/([^/?]+)\/status$/;
+const ROUTES = [
+  { method: 'GET',  pattern: /^\/ata\/v1\/agent-card$/, handler: (req, res) => handleAgentCard(req, res) },
+  { method: 'GET',  pattern: /^\/health$/,              handler: (req, res) => sendJson(res, 200, { ok: true, agent: config.agentId }) },
+  { method: 'POST', pattern: /^\/ata\/v1\/task$/,       handler: (req, res, body) => handleIncomingTask(req, res, body) },
+  { method: 'POST', pattern: /^\/ata\/v1\/callback\/([^/?]+)$/, handler: (req, res, body, m) => handleCallback(req, res, m[1], body) },
+  { method: 'GET',  pattern: /^\/ata\/v1\/task\/([^/?]+)\/status$/, handler: (req, res, _b, m) => handleStatusCheck(req, res, m[1]) },
+];
 
 async function router(req, res) {
   const url = req.url.split('?')[0];
   const method = req.method.toUpperCase();
 
   try {
-    // GET /ata/v1/agent-card
-    if (method === 'GET' && url === '/ata/v1/agent-card') {
-      return await handleAgentCard(req, res);
+    for (const route of ROUTES) {
+      if (route.method !== method) continue;
+      const match = route.pattern.exec(url);
+      if (!match) continue;
+      const body = (method === 'POST') ? await readBody(req) : null;
+      return await route.handler(req, res, body, match);
     }
-
-    // POST /ata/v1/task
-    if (method === 'POST' && url === '/ata/v1/task') {
-      const body = await readBody(req);
-      return await handleIncomingTask(req, res, body);
-    }
-
-    // POST /ata/v1/callback/:taskId
-    const callbackMatch = TASK_CALLBACK_RE.exec(url);
-    if (method === 'POST' && callbackMatch) {
-      const body = await readBody(req);
-      return await handleCallback(req, res, callbackMatch[1], body);
-    }
-
-    // GET /ata/v1/task/:taskId/status  (polling endpoint)
-    const statusMatch = TASK_STATUS_RE.exec(url);
-    if (method === 'GET' && statusMatch) {
-      return await handleStatusCheck(req, res, statusMatch[1]);
-    }
-
-    // Health check
-    if (method === 'GET' && url === '/health') {
-      return sendJson(res, 200, { ok: true, agent: config.agentId });
-    }
-
     sendJson(res, 404, { error: 'Not found', path: url });
   } catch (err) {
     console.error('[ATA] Unhandled error:', err);
@@ -261,19 +213,16 @@ server.listen(config.port, config.host, () => {
   console.log(`  Public : ${config.publicUrl}`);
   console.log(`  Key    : ${card.publicKey}`);
   console.log('');
-  console.log('  Endpoints:');
-  console.log(`    GET  ${config.publicUrl}/ata/v1/agent-card`);
-  console.log(`    POST ${config.publicUrl}/ata/v1/task`);
-  console.log(`    POST ${config.publicUrl}/ata/v1/callback/:taskId`);
-  console.log(`    GET  ${config.publicUrl}/ata/v1/task/:taskId/status`);
+  console.log(`  GET  ${config.publicUrl}/ata/v1/agent-card`);
+  console.log(`  POST ${config.publicUrl}/ata/v1/task`);
+  console.log(`  POST ${config.publicUrl}/ata/v1/callback/:taskId`);
   console.log('');
 });
 
-// Periodic cleanup of expired tasks
 setInterval(() => {
-  const deleted = storage.purgeExpired(config.taskTtlMs);
-  if (deleted > 0) console.log(`[ATA] Purged ${deleted} expired task(s)`);
-}, 60 * 60 * 1000); // every hour
+  const n = storage.purgeExpired(config.taskTtlMs);
+  if (n > 0) console.log(`[ATA] Purged ${n} expired task(s)`);
+}, 60 * 60 * 1000);
 
 process.on('SIGTERM', () => { server.close(); process.exit(0); });
-process.on('SIGINT', () => { server.close(); process.exit(0); });
+process.on('SIGINT',  () => { server.close(); process.exit(0); });
